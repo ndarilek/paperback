@@ -15,7 +15,7 @@ use wxdragon::{prelude::*, timer::Timer, translations::translate as t};
 
 use super::{
 	dialogs::{self, OptionsDialogFlags},
-	document_manager::DocumentManager,
+	document_manager::{DocumentManager, build_font_from_readability},
 	find::{self, FindDialogState},
 	help::{self, MAIN_WINDOW_PTR},
 	menu, menu_ids,
@@ -283,6 +283,7 @@ impl MainWindow {
 			state.restored = true;
 			drop(state);
 			let pre_restore_active = doc_manager.lock().unwrap().active_tab_index();
+			let active_path = config.lock().unwrap().get_app_string("active_document", "");
 			let paths = config.lock().unwrap().get_opened_documents_existing();
 			for path in paths {
 				let path = Path::new(&path);
@@ -291,7 +292,11 @@ impl MainWindow {
 				}
 				let _ = doc_manager.lock().unwrap().open_file(&doc_manager, path);
 			}
-			if let Some(idx) = pre_restore_active {
+			let mut target_idx = pre_restore_active;
+			if target_idx.is_none() && !active_path.is_empty() {
+				target_idx = doc_manager.lock().unwrap().find_tab_by_path(Path::new(&active_path));
+			}
+			if let Some(idx) = target_idx {
 				doc_manager.lock().unwrap().notebook().set_selection(idx);
 			}
 			let dm_ref = doc_manager.lock().unwrap();
@@ -994,14 +999,9 @@ impl MainWindow {
 						return;
 					};
 					if let Some(tab) = dm_ref.active_tab() {
-						let stats = tab.session.stats();
-						let msg_template = t("The document contains {} words.");
-						let msg = msg_template.replace("{}", &stats.word_count.to_string());
-						let title = t("Word count");
-						let dialog = MessageDialog::builder(&frame_copy, &msg, &title)
-							.with_style(MessageDialogStyle::OK)
-							.build();
-						dialog.show_modal();
+						let word_count = tab.session.stats().word_count;
+						let wpm = config.lock().unwrap().get_app_int("reading_speed_wpm", 150);
+						dialogs::show_word_count_dialog(&frame_copy, word_count, wpm);
 					}
 				}
 				menu_ids::DOCUMENT_INFO => {
@@ -1132,17 +1132,42 @@ impl MainWindow {
 					);
 					cfg.set_app_bool("bookmark_sounds", options.flags.contains(OptionsDialogFlags::BOOKMARK_SOUNDS));
 					cfg.set_app_int("recent_documents_to_show", options.recent_documents_to_show);
+					cfg.set_app_int("reading_speed_wpm", options.reading_speed_wpm);
 					cfg.set_app_string("language", &options.language);
 					cfg.set_update_channel(options.update_channel);
+					cfg.set_readability_font(&options.readability_font);
+					cfg.set_line_spacing(options.line_spacing);
+					cfg.set_bg_color(options.bg_color);
+					cfg.set_text_alignment(options.text_alignment);
+					cfg.set_letter_spacing(options.letter_spacing);
+					cfg.set_paragraph_spacing(options.paragraph_spacing);
 					cfg.flush();
 					drop(cfg);
 					let options_word_wrap = options.flags.contains(OptionsDialogFlags::WORD_WRAP);
-					if old_word_wrap != options_word_wrap {
+					if let Some(font) = build_font_from_readability(&options.readability_font) {
+						if old_word_wrap != options_word_wrap {
+							let dm_for_wrap = Rc::clone(&dm);
+							let mut dm_ref = dm.lock().unwrap();
+							dm_ref.apply_word_wrap(&dm_for_wrap, options_word_wrap);
+							dm_ref.restore_focus();
+						}
+						dm.lock().unwrap().apply_font(&font);
+						dm.lock().unwrap().apply_color(options.readability_font.color);
+						dm.lock().unwrap().apply_line_spacing(options.line_spacing);
+					} else {
+						// Font is default/reset: rebuild text controls so they inherit
+						// the system default font. apply_word_wrap re-applies all settings.
 						let dm_for_wrap = Rc::clone(&dm);
 						let mut dm_ref = dm.lock().unwrap();
 						dm_ref.apply_word_wrap(&dm_for_wrap, options_word_wrap);
 						dm_ref.restore_focus();
+						dm_ref.apply_color(options.readability_font.color);
 					}
+					// These apply regardless of font path
+					dm.lock().unwrap().apply_bg_color(options.bg_color);
+					dm.lock().unwrap().apply_text_alignment(options.text_alignment);
+					dm.lock().unwrap().apply_letter_spacing(options.letter_spacing);
+					dm.lock().unwrap().apply_paragraph_spacing(options.paragraph_spacing);
 					let options_compact_menu = options.flags.contains(OptionsDialogFlags::COMPACT_GO_MENU);
 					if current_language != options.language || old_compact_menu != options_compact_menu {
 						if current_language != options.language {
@@ -1207,7 +1232,18 @@ impl MainWindow {
 					help::handle_view_help_browser(&frame_copy);
 				}
 				menu_ids::VIEW_HELP_PAPERBACK => {
-					help::handle_view_help_paperback(&frame_copy, &dm, &config);
+					if help::handle_view_help_paperback(&frame_copy, &dm, &config) {
+						{
+							let dm_ref = dm.lock().unwrap();
+							update_title_from_manager(&frame_copy, &dm_ref);
+							dm_ref.restore_focus();
+						}
+						let menu_bar = menu::create_menu_bar(&config.lock().unwrap());
+						frame_copy.set_menu_bar(menu_bar);
+						menu::update_menu_item_states(&frame_copy, true);
+						let has_reopen = dm.lock().unwrap().has_recently_closed();
+						menu::update_reopen_state(&frame_copy, has_reopen);
+					}
 				}
 				menu_ids::CHECK_FOR_UPDATES => {
 					let channel = config.lock().unwrap().get_update_channel();
@@ -1254,9 +1290,22 @@ impl MainWindow {
 						}
 						let open_paths = dm.lock().unwrap().open_paths();
 						let config_for_dialog = Rc::clone(&config);
-						let selection = dialogs::show_all_documents_dialog(&frame_copy, &config_for_dialog, open_paths);
-						if let Some(path) = selection {
-							let path = Path::new(&path);
+						let result = dialogs::show_all_documents_dialog(&frame_copy, &config_for_dialog, open_paths);
+						{
+							let mut dm_ref = dm.lock().unwrap();
+							for path_str in &result.paths_to_close {
+								let path = Path::new(path_str);
+								if let Some(index) = dm_ref.find_tab_by_path(path) {
+									dm_ref.close_document(index);
+								}
+							}
+							if !result.paths_to_close.is_empty() {
+								update_title_from_manager(&frame_copy, &dm_ref);
+							}
+						}
+						if let Some(path) = result.open {
+							let path_buf = Path::new(&path).to_path_buf();
+							let path = path_buf.as_path();
 							if !ensure_parser_ready_for_path(&frame_copy, path, &config) {
 								return;
 							}
@@ -1270,6 +1319,15 @@ impl MainWindow {
 								frame_copy.set_menu_bar(menu_bar);
 								menu::update_menu_item_states(&frame_copy, true);
 								let has_reopen = dm.lock().unwrap().has_recently_closed();
+								menu::update_reopen_state(&frame_copy, has_reopen);
+							} else {
+								let menu_bar = menu::create_menu_bar(&config.lock().unwrap());
+								frame_copy.set_menu_bar(menu_bar);
+								let dm_ref = dm.lock().unwrap();
+								let has_docs = dm_ref.tab_count() > 0;
+								let has_reopen = dm_ref.has_recently_closed();
+								drop(dm_ref);
+								menu::update_menu_item_states(&frame_copy, has_docs);
 								menu::update_reopen_state(&frame_copy, has_reopen);
 							}
 						} else {

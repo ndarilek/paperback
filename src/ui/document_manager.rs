@@ -10,6 +10,7 @@ use std::{
 use std::collections::HashMap;
 
 use wxdragon::{
+	color::Colour,
 	event::{EventType, WindowEventData},
 	prelude::*,
 	translations::translate as t,
@@ -19,7 +20,11 @@ use super::{
 	main_window::{SLEEP_TIMER_DURATION_MINUTES, SLEEP_TIMER_START_MS},
 	menu_ids, status,
 };
-use crate::{config::ConfigManager, parser::PASSWORD_REQUIRED_ERROR_PREFIX, session::DocumentSession};
+use crate::{
+	config::{ConfigManager, ReadabilityFont},
+	parser::PASSWORD_REQUIRED_ERROR_PREFIX,
+	session::DocumentSession,
+};
 
 pub struct DocumentTab {
 	pub panel: Panel,
@@ -80,6 +85,7 @@ impl DocumentManager {
 		let (password, forced_extension) = {
 			let config = self.config.lock().unwrap();
 			let path_str = path.to_string_lossy();
+			config.refresh_document_hash(&path_str);
 			config.import_document_settings(&path_str);
 			let forced_extension = config.get_document_format(&path_str);
 			let password = config.get_document_password(&path_str);
@@ -141,11 +147,24 @@ impl DocumentManager {
 		let text_ctrl = Self::build_text_ctrl(panel, word_wrap, self_rc, self.frame, Rc::clone(&self.navigation_key_map));
 		#[cfg(not(target_os = "linux"))]
 		let text_ctrl = Self::build_text_ctrl(panel, word_wrap, self_rc);
+		let rf = config.get_readability_font();
+		if let Some(font) = build_font_from_readability(&rf) {
+			text_ctrl.set_font(&font);
+		}
+		apply_foreground_color_to_ctrl(text_ctrl, rf.color);
+		apply_bg_color_to_ctrl(text_ctrl, config.get_bg_color());
 		let sizer = BoxSizer::builder(Orientation::Vertical).build();
 		sizer.add(&text_ctrl, 1, SizerFlag::Expand | SizerFlag::All, 0);
 		panel.set_sizer(sizer, true);
 		let content = session.content();
 		fill_text_ctrl(text_ctrl, &content);
+		apply_readability_format_to_ctrl(
+			text_ctrl,
+			config.get_line_spacing(),
+			config.get_paragraph_spacing(),
+			config.get_letter_spacing(),
+			config.get_text_alignment(),
+		);
 		self.notebook.add_page(&panel, &title, true, None);
 		let path_str = path.to_string_lossy();
 		let nav_history = config.get_navigation_history(&path_str);
@@ -370,23 +389,13 @@ impl DocumentManager {
 		let path_str = tab.file_path.to_string_lossy().to_string();
 		let bookmarks = config.get_bookmarks(&path_str);
 		drop(config);
-		let (prev_line_start, _) = tab.session.get_line_bounds(prev);
-		let (line_start, line_end) = tab.session.get_line_bounds(position);
-		let same_line = prev_line_start == line_start;
 		let mut has_note = false;
 		let mut has_bookmark = false;
 		for bm in &bookmarks {
-			let triggered = if same_line {
-				// Within the same content line: use precise range crossing (for Ctrl+Left/Right).
-				if position > prev {
-					bm.start > prev && bm.start <= position
-				} else {
-					bm.start >= position && bm.start < prev
-				}
+			let triggered = if position > prev {
+				bm.start > prev && bm.start <= position
 			} else {
-				// Crossed a line boundary (Up/Down): fire only if a bookmark is on the
-				// current line. This prevents false positives when jumping over bookmarks.
-				bm.start >= line_start && bm.start <= line_end
+				bm.start >= position && bm.start < prev
 			};
 			if triggered {
 				if !bm.note.is_empty() {
@@ -405,7 +414,67 @@ impl DocumentManager {
 		self.last_sound_position.set(None);
 	}
 
+	pub fn apply_font(&self, font: &Font) {
+		for tab in &self.tabs {
+			tab.text_ctrl.set_font(font);
+			tab.text_ctrl.refresh(true, None);
+		}
+	}
+
+	pub fn apply_color(&self, color: i32) {
+		for tab in &self.tabs {
+			apply_foreground_color_to_ctrl(tab.text_ctrl, color);
+			tab.text_ctrl.refresh(true, None);
+		}
+	}
+
+	pub fn apply_bg_color(&self, color: i32) {
+		for tab in &self.tabs {
+			apply_bg_color_to_ctrl(tab.text_ctrl, color);
+			tab.text_ctrl.refresh(true, None);
+		}
+	}
+
+	pub fn apply_text_alignment(&self, alignment: i32) {
+		for tab in &self.tabs {
+			apply_text_alignment_to_ctrl(tab.text_ctrl, alignment);
+			tab.text_ctrl.refresh(true, None);
+		}
+	}
+
+	pub fn apply_letter_spacing(&self, spacing: i32) {
+		for tab in &self.tabs {
+			apply_letter_spacing_to_ctrl(tab.text_ctrl, spacing);
+			tab.text_ctrl.refresh(true, None);
+		}
+	}
+
+	pub fn apply_paragraph_spacing(&self, spacing: i32) {
+		for tab in &self.tabs {
+			apply_paragraph_spacing_to_ctrl(tab.text_ctrl, spacing);
+			tab.text_ctrl.refresh(true, None);
+		}
+	}
+
+	pub fn apply_line_spacing(&self, line_spacing: i32) {
+		for tab in &self.tabs {
+			apply_line_spacing_to_ctrl(tab.text_ctrl, line_spacing);
+			tab.text_ctrl.refresh(true, None);
+		}
+	}
+
 	pub fn apply_word_wrap(&mut self, self_rc: &Rc<Mutex<Self>>, word_wrap: bool) {
+		let (rf, line_spacing, bg_color, text_alignment, letter_spacing, paragraph_spacing) = {
+			let cfg = self.config.lock().unwrap();
+			(
+				cfg.get_readability_font(),
+				cfg.get_line_spacing(),
+				cfg.get_bg_color(),
+				cfg.get_text_alignment(),
+				cfg.get_letter_spacing(),
+				cfg.get_paragraph_spacing(),
+			)
+		};
 		for tab in &mut self.tabs {
 			let old_ctrl = tab.text_ctrl;
 			let current_pos = old_ctrl.get_insertion_point();
@@ -418,6 +487,15 @@ impl DocumentManager {
 			sizer.add(&text_ctrl, 1, SizerFlag::Expand | SizerFlag::All, 0);
 			tab.panel.set_sizer(sizer, true);
 			fill_text_ctrl(text_ctrl, &content);
+			if let Some(font) = build_font_from_readability(&rf) {
+				text_ctrl.set_font(&font);
+			}
+			apply_foreground_color_to_ctrl(text_ctrl, rf.color);
+			apply_bg_color_to_ctrl(text_ctrl, bg_color);
+			apply_line_spacing_to_ctrl(text_ctrl, line_spacing);
+			apply_paragraph_spacing_to_ctrl(text_ctrl, paragraph_spacing);
+			apply_letter_spacing_to_ctrl(text_ctrl, letter_spacing);
+			apply_text_alignment_to_ctrl(text_ctrl, text_alignment);
 			let max_pos = text_ctrl.get_last_position();
 			let pos = current_pos.clamp(0, max_pos);
 			text_ctrl.set_insertion_point(pos);
@@ -543,6 +621,272 @@ fn build_document_load_error_message(path: &Path, error: &str) -> String {
 
 fn fill_text_ctrl(text_ctrl: TextCtrl, content: &str) {
 	text_ctrl.set_value(content);
+}
+
+#[cfg(target_os = "windows")]
+pub fn apply_line_spacing_to_ctrl(text_ctrl: TextCtrl, line_spacing: i32) {
+	use windows::Win32::{
+		Foundation::{HWND, LPARAM, WPARAM},
+		UI::{
+			Controls::RichEdit::{PARAFORMAT2, PFM_LINESPACING},
+			WindowsAndMessaging::SendMessageW,
+		},
+	};
+	const EM_SETSEL: u32 = 177;
+	const EM_SETPARAFORMAT: u32 = 1095;
+	let hwnd_ptr = text_ctrl.get_handle();
+	if hwnd_ptr.is_null() {
+		return;
+	}
+	let hwnd = HWND(hwnd_ptr);
+	unsafe {
+		SendMessageW(hwnd, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1_isize)));
+		let mut pf = PARAFORMAT2::default();
+		pf.Base.cbSize = std::mem::size_of::<PARAFORMAT2>() as u32;
+		pf.Base.dwMask = PFM_LINESPACING;
+		pf.bLineSpacingRule = line_spacing.clamp(0, 2) as u8;
+		SendMessageW(hwnd, EM_SETPARAFORMAT, None, Some(LPARAM(&raw const pf as isize)));
+		SendMessageW(hwnd, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(0)));
+	}
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn apply_line_spacing_to_ctrl(_text_ctrl: TextCtrl, _line_spacing: i32) {}
+
+pub fn build_font_from_readability(rf: &ReadabilityFont) -> Option<Font> {
+	if rf.is_default() {
+		return None;
+	}
+	let point_size = if rf.point_size > 0 { rf.point_size } else { 10 };
+	let mut font = Font::new_with_details(
+		point_size,
+		FontFamily::Default.as_i32(),
+		rf.style,
+		rf.weight,
+		rf.underlined,
+		&rf.face_name,
+	)?;
+	if rf.strikethrough {
+		font.set_strikethrough(true);
+	}
+	if rf.encoding != 0 {
+		font.set_encoding(rf.encoding);
+	}
+	Some(font)
+}
+
+pub fn apply_foreground_color_to_ctrl(text_ctrl: TextCtrl, color: i32) {
+	if color >= 0 {
+		let r = ((color >> 16) & 0xFF) as u8;
+		let g = ((color >> 8) & 0xFF) as u8;
+		let b = (color & 0xFF) as u8;
+		text_ctrl.set_foreground_color(Colour::rgb(r, g, b));
+	}
+}
+
+pub fn apply_bg_color_to_ctrl(text_ctrl: TextCtrl, color: i32) {
+	if color >= 0 {
+		let r = ((color >> 16) & 0xFF) as u8;
+		let g = ((color >> 8) & 0xFF) as u8;
+		let b = (color & 0xFF) as u8;
+		text_ctrl.set_background_color(Colour::rgb(r, g, b));
+	}
+}
+
+#[cfg(target_os = "windows")]
+pub fn apply_text_alignment_to_ctrl(text_ctrl: TextCtrl, alignment: i32) {
+	use windows::Win32::{
+		Foundation::{HWND, LPARAM, WPARAM},
+		UI::{
+			Controls::RichEdit::{PARAFORMAT2, PFA_CENTER, PFA_JUSTIFY, PFA_LEFT, PFA_RIGHT, PFM_ALIGNMENT},
+			WindowsAndMessaging::SendMessageW,
+		},
+	};
+	const EM_SETSEL: u32 = 177;
+	const EM_SETPARAFORMAT: u32 = 1095;
+	let hwnd_ptr = text_ctrl.get_handle();
+	if hwnd_ptr.is_null() {
+		return;
+	}
+	let hwnd = HWND(hwnd_ptr);
+	let pfa = match alignment {
+		1 => PFA_CENTER,
+		2 => PFA_RIGHT,
+		3 => PFA_JUSTIFY,
+		_ => PFA_LEFT,
+	};
+	unsafe {
+		SendMessageW(hwnd, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1_isize)));
+		let mut pf = PARAFORMAT2::default();
+		pf.Base.cbSize = std::mem::size_of::<PARAFORMAT2>() as u32;
+		pf.Base.dwMask = PFM_ALIGNMENT;
+		pf.Base.wAlignment = pfa;
+		SendMessageW(hwnd, EM_SETPARAFORMAT, None, Some(LPARAM(&raw const pf as isize)));
+		SendMessageW(hwnd, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(0)));
+	}
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn apply_text_alignment_to_ctrl(_text_ctrl: TextCtrl, _alignment: i32) {}
+
+#[cfg(target_os = "windows")]
+pub fn apply_letter_spacing_to_ctrl(text_ctrl: TextCtrl, spacing: i32) {
+	use windows::Win32::{
+		Foundation::{HWND, LPARAM, WPARAM},
+		UI::{
+			Controls::RichEdit::{CFM_SPACING, CHARFORMAT2W},
+			WindowsAndMessaging::SendMessageW,
+		},
+	};
+	const EM_SETSEL: u32 = 177;
+	const EM_SETCHARFORMAT: u32 = 1092;
+	const SCF_ALL: u32 = 4;
+	let hwnd_ptr = text_ctrl.get_handle();
+	if hwnd_ptr.is_null() {
+		return;
+	}
+	let hwnd = HWND(hwnd_ptr);
+	// spacing_twips: 0=normal, 1=20 twips (~1pt extra), 2=40 twips (~2pt extra)
+	let spacing_twips: i16 = match spacing {
+		1 => 20,
+		2 => 40,
+		_ => 0,
+	};
+	unsafe {
+		SendMessageW(hwnd, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1_isize)));
+		let mut cf = std::mem::zeroed::<CHARFORMAT2W>();
+		cf.Base.cbSize = std::mem::size_of::<CHARFORMAT2W>() as u32;
+		cf.Base.dwMask = CFM_SPACING;
+		cf.sSpacing = spacing_twips;
+		SendMessageW(hwnd, EM_SETCHARFORMAT, Some(WPARAM(SCF_ALL as usize)), Some(LPARAM(&raw const cf as isize)));
+		SendMessageW(hwnd, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(0)));
+	}
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn apply_letter_spacing_to_ctrl(_text_ctrl: TextCtrl, _spacing: i32) {}
+
+#[cfg(target_os = "windows")]
+pub fn apply_paragraph_spacing_to_ctrl(text_ctrl: TextCtrl, spacing: i32) {
+	use windows::Win32::{
+		Foundation::{HWND, LPARAM, WPARAM},
+		UI::{
+			Controls::RichEdit::{PARAFORMAT2, PFM_SPACEAFTER},
+			WindowsAndMessaging::SendMessageW,
+		},
+	};
+	const EM_SETSEL: u32 = 177;
+	const EM_SETPARAFORMAT: u32 = 1095;
+	let hwnd_ptr = text_ctrl.get_handle();
+	if hwnd_ptr.is_null() {
+		return;
+	}
+	let hwnd = HWND(hwnd_ptr);
+	// spacing in twips: 0=none, 1=120 twips (~6pt), 2=240 twips (~12pt)
+	let space_after: i32 = match spacing {
+		1 => 120,
+		2 => 240,
+		_ => 0,
+	};
+	unsafe {
+		SendMessageW(hwnd, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1_isize)));
+		let mut pf = PARAFORMAT2::default();
+		pf.Base.cbSize = std::mem::size_of::<PARAFORMAT2>() as u32;
+		pf.Base.dwMask = PFM_SPACEAFTER;
+		pf.dySpaceAfter = space_after;
+		SendMessageW(hwnd, EM_SETPARAFORMAT, None, Some(LPARAM(&raw const pf as isize)));
+		SendMessageW(hwnd, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(0)));
+	}
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn apply_paragraph_spacing_to_ctrl(_text_ctrl: TextCtrl, _spacing: i32) {}
+
+/// Applies all paragraph/character readability formats in one batched operation.
+/// Returns immediately with no Windows messages when all values are at their defaults (all 0).
+/// For non-default values, suppresses redraws across both format passes so the control
+/// only repaints once at the end.
+#[cfg(target_os = "windows")]
+pub fn apply_readability_format_to_ctrl(
+	text_ctrl: TextCtrl,
+	line_spacing: i32,
+	para_spacing: i32,
+	letter_spacing: i32,
+	alignment: i32,
+) {
+	if line_spacing == 0 && para_spacing == 0 && letter_spacing == 0 && alignment == 0 {
+		return;
+	}
+	use windows::Win32::{
+		Foundation::{HWND, LPARAM, RECT, WPARAM},
+		Graphics::Gdi::InvalidateRect,
+		UI::{
+			Controls::RichEdit::{
+				CFM_SPACING, CHARFORMAT2W, PARAFORMAT2, PFA_CENTER, PFA_JUSTIFY, PFA_LEFT, PFA_RIGHT, PFM_ALIGNMENT,
+				PFM_LINESPACING, PFM_SPACEAFTER,
+			},
+			WindowsAndMessaging::SendMessageW,
+		},
+	};
+	const EM_SETSEL: u32 = 177;
+	const EM_SETPARAFORMAT: u32 = 1095;
+	const EM_SETCHARFORMAT: u32 = 1092;
+	const SCF_ALL: u32 = 4;
+	const WM_SETREDRAW: u32 = 11;
+	let hwnd_ptr = text_ctrl.get_handle();
+	if hwnd_ptr.is_null() {
+		return;
+	}
+	let hwnd = HWND(hwnd_ptr);
+	unsafe {
+		SendMessageW(hwnd, WM_SETREDRAW, Some(WPARAM(0)), None);
+		SendMessageW(hwnd, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1_isize)));
+
+		// Combine line spacing + paragraph spacing + alignment into one EM_SETPARAFORMAT
+		let mut pf = PARAFORMAT2::default();
+		pf.Base.cbSize = std::mem::size_of::<PARAFORMAT2>() as u32;
+		pf.Base.dwMask = PFM_LINESPACING | PFM_SPACEAFTER | PFM_ALIGNMENT;
+		pf.bLineSpacingRule = line_spacing.clamp(0, 2) as u8;
+		pf.dySpaceAfter = match para_spacing {
+			1 => 120,
+			2 => 240,
+			_ => 0,
+		};
+		pf.Base.wAlignment = match alignment {
+			1 => PFA_CENTER,
+			2 => PFA_RIGHT,
+			3 => PFA_JUSTIFY,
+			_ => PFA_LEFT,
+		};
+		SendMessageW(hwnd, EM_SETPARAFORMAT, None, Some(LPARAM(&raw const pf as isize)));
+
+		if letter_spacing != 0 {
+			let spacing_twips: i16 = match letter_spacing {
+				1 => 20,
+				2 => 40,
+				_ => 0,
+			};
+			let mut cf = std::mem::zeroed::<CHARFORMAT2W>();
+			cf.Base.cbSize = std::mem::size_of::<CHARFORMAT2W>() as u32;
+			cf.Base.dwMask = CFM_SPACING;
+			cf.sSpacing = spacing_twips;
+			SendMessageW(hwnd, EM_SETCHARFORMAT, Some(WPARAM(SCF_ALL as usize)), Some(LPARAM(&raw const cf as isize)));
+		}
+
+		SendMessageW(hwnd, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(0)));
+		SendMessageW(hwnd, WM_SETREDRAW, Some(WPARAM(1)), None);
+		let _ = InvalidateRect(Some(hwnd), None::<*const RECT>, true);
+	}
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn apply_readability_format_to_ctrl(
+	_text_ctrl: TextCtrl,
+	_line_spacing: i32,
+	_para_spacing: i32,
+	_letter_spacing: i32,
+	_alignment: i32,
+) {
 }
 
 fn show_reader_context_menu(text_ctrl: TextCtrl) {

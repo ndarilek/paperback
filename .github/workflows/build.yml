@@ -26,7 +26,13 @@ jobs:
         components: rustfmt, clippy
     - name: Install CMake, Ninja, and Pandoc
       run: |
-        choco install cmake ninja pandoc -y
+        choco install cmake ninja pandoc minisign -y
+    - name: Install WebView2 SDK
+      run: |
+        nuget install Microsoft.Web.WebView2 -OutputDirectory packages
+        $pkg = Get-ChildItem "packages" -Filter "Microsoft.Web.WebView2.*" -Directory | Select-Object -First 1
+        $libPath = Join-Path $pkg.FullName "build\native\x64"
+        echo "LIB=$env:LIB;$libPath" >> $env:GITHUB_ENV
     - name: Install Gettext via MSYS2
       uses: msys2/setup-msys2@v2
       with:
@@ -42,13 +48,26 @@ jobs:
         $env:WXWIDGETS_DIR = "${{ github.workspace }}\wxWidgets"
         $env:PATH = "$env:PATH;C:\msys64\ucrt64\bin;C:\msys64\usr\bin"
         cargo release
+    - name: Sign artifacts
+      shell: pwsh
+      env:
+        MINISIGN_KEY: ${{ secrets.MINISIGN_KEY }}
+        MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+      run: |
+        $keyPath = Join-Path $env:RUNNER_TEMP "paperback.key"
+        [IO.File]::WriteAllText($keyPath, $env:MINISIGN_KEY)
+        Write-Output $env:MINISIGN_PASSWORD | minisign -S -s $keyPath -m target/release/paperback_setup.exe
+        Write-Output $env:MINISIGN_PASSWORD | minisign -S -s $keyPath -m target/release/paperback.zip
+        Remove-Item $keyPath
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
         name: paperback-windows
         path: |
           target/release/paperback.zip
+          target/release/paperback.zip.minisig
           target/release/paperback_setup.exe
+          target/release/paperback_setup.exe.minisig
         retention-days: 30
 
   build-linux-flatpak:
@@ -120,7 +139,9 @@ jobs:
           ${{ steps.release_notes.outputs.commits }}
         files: |
           windows-build/paperback.zip
+          windows-build/paperback.zip.minisig
           windows-build/paperback_setup.exe
+          windows-build/paperback_setup.exe.minigig
           linux-build/paperback.flatpak
         prerelease: true
       env:

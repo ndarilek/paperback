@@ -108,14 +108,14 @@ pub fn handle_view_help_paperback(
 	frame: &Frame,
 	doc_manager: &Rc<Mutex<DocumentManager>>,
 	config: &Rc<Mutex<ConfigManager>>,
-) {
+) -> bool {
 	let Some(path) = readme_path() else {
 		show_error_message(
 			frame,
 			&t("readme.html not found. Please ensure the application was built properly."),
 			&t("Error"),
 		);
-		return;
+		return false;
 	};
 	if !path.exists() {
 		show_error_message(
@@ -123,12 +123,12 @@ pub fn handle_view_help_paperback(
 			&t("readme.html not found. Please ensure the application was built properly."),
 			&t("Error"),
 		);
-		return;
+		return false;
 	}
 	if !ensure_parser_ready_for_path(frame, &path, config) {
-		return;
+		return false;
 	}
-	let _ = doc_manager.lock().unwrap().open_file(doc_manager, &path);
+	doc_manager.lock().unwrap().open_file(doc_manager, &path)
 }
 
 pub fn handle_donate(frame: &Frame) {
@@ -170,6 +170,7 @@ fn handle_update_available(
 		return;
 	}
 	let download_url = result.download_url;
+	let signature_url = result.signature_url;
 	let progress = ProgressDialog::builder(parent, &t("Paperback Update"), &t("Downloading update..."), 100)
 		.with_style(ProgressDialogStyle::AutoHide | ProgressDialogStyle::AppModal | ProgressDialogStyle::RemainingTime)
 		.build();
@@ -207,7 +208,7 @@ fn handle_update_available(
 	let d_total = total;
 	let d_is_running = is_running;
 	thread::spawn(move || {
-		let res = update::download_update_file(&download_url, |d, t| {
+		let _res = update::download_update_file(&download_url, &signature_url, |d, t| {
 			d_downloaded.store(d, Ordering::Relaxed);
 			d_total.store(t, Ordering::Relaxed);
 		});
@@ -217,7 +218,7 @@ fn handle_update_available(
 				*p.borrow_mut() = None;
 			});
 			#[cfg(target_os = "windows")]
-			execute_update(res);
+			execute_update(_res);
 		}));
 	});
 }
@@ -250,6 +251,10 @@ fn handle_update_error(parent: Option<&ParentWindow>, silent: bool, err: &Update
 		UpdateError::HttpError(code) if *code > 0 => {
 			let template = t("Failed to check for updates. HTTP status: %d");
 			(template.replacen("%d", &code.to_string(), 1), t("Error"))
+		}
+		UpdateError::VerificationError(msg) => {
+			let template = t("Security verification failed. The update might have been tampered with: {}");
+			(template.replace("{}", msg), t("Security Error"))
 		}
 		_ => {
 			let msg = err.to_string();

@@ -30,6 +30,7 @@ fn main() {
 	configure_installer();
 	generate_pot();
 	let target = env::var("TARGET").unwrap_or_default();
+	embed_commit_hash();
 	if target.contains("apple") {
 		// Homebrew's libiconv is keg-only and not on the default search path.
 		// wxWidgets links against it, so we need to tell the linker where to find it.
@@ -52,7 +53,6 @@ fn main() {
 			println!("cargo:warning=The application will still work but may lack optimal Windows theming");
 		}
 		embed_version_info();
-		embed_commit_hash();
 		println!("cargo:rerun-if-changed=build.rs");
 	}
 }
@@ -512,20 +512,34 @@ fn generate_app_bundle() {
 				<string>epub</string>
 				<string>pdf</string>
 				<string>docx</string>
+				<string>docm</string>
+				<string>doc</string>
 				<string>odt</string>
 				<string>fodt</string>
 				<string>pptx</string>
+				<string>pptm</string>
+				<string>ppt</string>
 				<string>odp</string>
 				<string>fodp</string>
 				<string>chm</string>
 				<string>fb2</string>
 				<string>html</string>
 				<string>htm</string>
+				<string>xhtml</string>
 				<string>md</string>
+				<string>markdown</string>
+				<string>mdx</string>
+				<string>mdown</string>
+				<string>mdwn</string>
+				<string>mkd</string>
+				<string>mkdn</string>
+				<string>mkdown</string>
+				<string>ronn</string>
 				<string>mobi</string>
-				<string>azw3</string>
 				<string>txt</string>
+				<string>log</string>
 				<string>rtf</string>
+				<string>opf</string>
 			</array>
 			<key>CFBundleTypeName</key>
 			<string>Document</string>
